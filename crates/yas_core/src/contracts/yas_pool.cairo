@@ -21,13 +21,27 @@ trait IYASPool<TContractState> {
         amount: u128,
         data: Array<felt252>
     ) -> (u256, u256);
+    fn create_limit_order(
+        ref self: TContractState,
+        recipient: ContractAddress,
+        tick_lower: i32,
+        amount: u128,
+    );
+    fn collect_limit_order(
+        ref self: TContractState,
+        recipient: ContractAddress,
+        tick_lower: i32,
+    );
     fn token_0(self: @TContractState) -> ContractAddress;
     fn token_1(self: @TContractState) -> ContractAddress;
 }
 
 #[starknet::contract]
 mod YASPool {
-    use super::IYASPool;
+    use core::zeroable::Zeroable;
+use super::IYASPool;
+    use poseidon::PoseidonTrait;
+    use hash::{HashStateTrait, HashStateExTrait};
 
     use starknet::{ContractAddress, get_block_timestamp, get_caller_address, get_contract_address};
 
@@ -152,6 +166,12 @@ mod YASPool {
         liquidity_delta: i128
     }
 
+    #[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+    struct Order {
+        initial_amount: u128,
+        amount: u128,
+    }
+
     #[storage]
     struct Storage {
         factory: ContractAddress,
@@ -165,7 +185,12 @@ mod YASPool {
         fee_growth_global_1_X128: u256,
         protocol_fees: ProtocolFees,
         tick_spacing: i32,
-        unlocked: bool
+        unlocked: bool,
+        // Bal7hazar changes
+        orders_key_len: LegacyMap<i32, u32>,
+        orders_key_index: LegacyMap<(i32, felt252), u32>,
+        orders_key: LegacyMap<(i32, u32), felt252>,
+        orders: LegacyMap<felt252, Order>,
     }
 
     #[constructor]
@@ -277,11 +302,48 @@ mod YASPool {
             let mut state_tick = Tick::unsafe_new_contract_state();
 
             // continue swapping as long as we haven't used the entire input/output and haven't reached the price limit
+            let mut filled_amount: i256 = Zeroable::zero();
             loop {
                 if state.amount_specified_remaining.is_zero()
                     || state.sqrt_price_X96 == sqrt_price_limit_X96 {
                     break;
                 }
+
+                // <-- BAL7HAZAR CHANGES -->
+                // [Effect] Manage orders for the current tick
+                let mut orders_key_len = self.orders_key_len.read(state.tick);
+                let mut to_fill_amount = amount_specified - state.amount_specified_remaining - filled_amount;
+                let mut order_index = 0;
+                loop {
+                    if to_fill_amount.is_zero() && orders_key_len == order_index {
+                        break;
+                    };
+                    let order_key = self.orders_key.read((state.tick, order_index));
+                    let mut order = self.orders.read(order_key);
+                    // TODO: Manage amount direction
+                    if order.initial_amount.into() < to_fill_amount.try_into().unwrap() {
+                        order.amount = order.initial_amount;
+                        to_fill_amount -= i256 { mag: order.initial_amount.into(), sign: false };
+                        // [Effect] Remove filled order, to save gas it will brings the last to the current index
+                        self.remove_order(state.tick, order_key);
+                        orders_key_len -= 1;
+                        // Trick to keep the right order order
+                        if order_index + 1 < orders_key_len {
+                            order_index += 1;
+                        } else {
+                            order_index = 0;
+                        };
+                    } else {
+                        if to_fill_amount.sign {
+                            order.amount += (-to_fill_amount).try_into().unwrap().try_into().unwrap();
+                        } else {
+                            order.amount += to_fill_amount.try_into().unwrap().try_into().unwrap();
+                        }
+                        to_fill_amount = Zeroable::zero();
+                    };
+                };
+                filled_amount += amount_specified - state.amount_specified_remaining - filled_amount;
+                // <-- BAL7HAZAR CHANGES -->
 
                 let step_sqrt_price_start_X96 = state.sqrt_price_X96;
 
@@ -535,6 +597,63 @@ mod YASPool {
             self.unlock();
             (amount_0, amount_1)
         }
+
+        fn create_limit_order(
+            ref self: ContractState,
+            recipient: ContractAddress,
+            tick_lower: i32,
+            amount: u128,
+        ) {
+            // [Check] Above the current price
+            let current_price = self.slot_0.read().sqrt_price_X96;
+            let lower_price = get_sqrt_ratio_at_tick(tick_lower);
+            assert(lower_price > current_price, 'tick_lower too low');
+
+            // [Check] Order not already exists
+            let tick_upper = tick_lower + self.tick_spacing.read();
+            let position_key = PositionKey { owner: recipient, tick_lower, tick_upper };
+            let order_key = PoseidonTrait::new().update_with(position_key).finalize();
+            let order_index = self.orders_key_index.read((tick_lower, order_key));
+            let stored_order_key = self.orders_key.read((tick_lower, order_index));
+            assert(order_key != stored_order_key, 'order already exists');
+
+            // [Effect] Store order
+            let order: Order = Order { initial_amount: amount, amount: 0 };
+            self.orders.write(order_key, order);
+            self.orders_key.write((tick_lower, order_index), order_key);
+            self.orders_key_index.write((tick_lower, order_key), order_index);
+            self.orders_key_len.write(tick_lower, order_index + 1);
+
+            // [Effect] Mint
+            self.mint(recipient, tick_lower, tick_upper, amount, array![]);
+            
+            // TODO: Emit event if needed
+        }
+
+        fn collect_limit_order(
+            ref self: ContractState,
+            recipient: ContractAddress,
+            tick_lower: i32,
+        ) {
+            // [Compute] Get position
+            let tick_upper = tick_lower + self.tick_spacing.read();
+            let position_key = PositionKey { owner: recipient, tick_lower, tick_upper };
+            let order_key = PoseidonTrait::new().update_with(position_key).finalize();
+            let order = self.orders.read(order_key);
+
+            // [Check] Order exists
+            assert(order.initial_amount > 0, 'order does not exists');
+
+            // [Effect] Transfer swaped tokens
+            let amount_owed = order.initial_amount - order.amount;
+            if amount_owed > 0 {
+                // TODO: Update owed tokens in position
+            }
+
+            // [Effect] Burn remaining position 
+            // self.burn(tick_lower, tick_upper, ?);
+            
+        }
     }
 
     #[generate_trait]
@@ -763,6 +882,23 @@ mod YASPool {
         fn balance_1(self: @ContractState) -> u256 {
             IERC20Dispatcher { contract_address: self.token_1.read() }
                 .balanceOf(get_contract_address())
+        }
+
+        fn remove_order(ref self: ContractState, tick: i32, order_key: felt252) {
+            // [Compute] Last order
+            let last_order_index = self.orders_key_len.read(tick) - 1;
+            let last_order_key = self.orders_key.read((tick, last_order_index));
+            // [Compute] Remove the last one
+            // TODO: ensure reauired, set storage to 0 must be free
+            let order_index = self.orders_key_index.read((tick, order_key));
+            self.orders_key.write((tick, last_order_index), 0);
+            self.orders_key_index.write((tick, order_key), 0);
+            self.orders_key_len.write(tick, last_order_index);
+            if last_order_index != order_index {
+                // [Effect] Replace the one to remove
+                self.orders_key_index.write((tick, last_order_key), order_index);
+                self.orders_key.write((tick, order_index), last_order_key);
+            };
         }
     }
 
