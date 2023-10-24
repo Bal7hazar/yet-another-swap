@@ -64,8 +64,8 @@ mod YASPool {
         FixedType, FixedTrait, FP64x96PartialOrd, FP64x96PartialEq, FP64x96Impl, FP64x96Zeroable
     };
     use yas_core::numbers::signed_integer::{
-        i32::i32, i32::i32_div_no_round, i64::i64, i128::{i128, u128Intoi128},
-        i256::{i256, i256TryIntou256}, integer_trait::IntegerTrait
+        i32::i32, i64::i64, i128::{i128, u128Intoi128}, i256::{i256, i256TryIntou256},
+        integer_trait::IntegerTrait
     };
     use yas_core::utils::math_utils::Constants::Q128;
     use yas_core::utils::math_utils::FullMath;
@@ -313,7 +313,6 @@ mod YASPool {
             let mut state_tick = Tick::unsafe_new_contract_state();
 
             // continue swapping as long as we haven't used the entire input/output and haven't reached the price limit
-            let mut filled_amount: i256 = Zeroable::zero();
             loop {
                 if state.amount_specified_remaining.is_zero()
                     || state.sqrt_price_X96 == sqrt_price_limit_X96 {
@@ -343,7 +342,7 @@ mod YASPool {
                     } else {
                         (state.tick, zero_for_one)
                     };
-                    // [Effect] Erase array by setting length to 0, gas free
+                    // [Effect] Erase array by setting length to 0, gas free if it was already 0
                     self.orders_key_len.write(key, 0)
                 };
 
