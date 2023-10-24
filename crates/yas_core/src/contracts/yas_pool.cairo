@@ -337,10 +337,10 @@ mod YASPool {
                 // <-- BAL7HAZAR CHANGES -->
                 // [Compute] If tick changes, fill corresponding orders
                 if state.tick != step_tick_next {
-                    let key = if state.tick > step_tick_next {
-                        (step_tick_next, zero_for_one)
-                    } else {
+                    let key = if step_tick_next > state.tick {
                         (state.tick, zero_for_one)
+                    } else {
+                        (step_tick_next, zero_for_one)
                     };
                     // [Effect] Erase array by setting length to 0, gas free if it was already 0
                     self.orders_key_len.write(key, 0)
@@ -653,7 +653,7 @@ mod YASPool {
             let stored_order_len = self
                 .orders_key_len
                 .read((tick_lower, stored_order.zero_for_one));
-            let stored_order_key = if stored_order_len < stored_order_index {
+            let stored_order_key = if stored_order_index < stored_order_len {
                 self.orders_key.read((tick_lower, stored_order.zero_for_one, stored_order_index))
             } else {
                 0
@@ -662,11 +662,13 @@ mod YASPool {
                 // [Compute] If order has been filled, update position with a custom tick
                 let mut slot_0 = self.slot_0.read();
                 let tick = if stored_order.zero_for_one {
-                    tick_upper
-                } else {
                     tick_lower
+                } else {
+                    tick_upper
                 };
+                // Trick the slot0 to simulate the order filled
                 slot_0.tick = tick;
+                slot_0.sqrt_price_X96 = get_sqrt_ratio_at_tick(tick);
                 let (_, amount_0, amount_1) = self
                     .modify_position(
                         ModifyPositionParams {

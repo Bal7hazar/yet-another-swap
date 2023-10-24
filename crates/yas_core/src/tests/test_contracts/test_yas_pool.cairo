@@ -564,6 +564,7 @@ mod YASPoolTests {
     }
 
     mod LimitOrder {
+        use debug::PrintTrait;
         use super::{setup, get_tick_zero, get_left_tick, get_right_tick, get_min_tick_and_max_tick};
 
         use starknet::ContractAddress;
@@ -789,7 +790,7 @@ mod YASPoolTests {
         #[should_panic(
             expected: ('order must be collected', 'ENTRYPOINT_FAILED', 'ENTRYPOINT_FAILED')
         )]
-        fn test_create_limit_order_and_swap_one_for_zero_and_recreate_revert() {
+        fn test_create_limit_order_and_swap_deswap_and_recreate_revert() {
             let (yas_pool, yas_router, token_0, token_1) = setup();
             let tick_zero = get_tick_zero();
             let tick_lower = get_right_tick(tick_zero, FeeAmount::LOW);
@@ -808,6 +809,54 @@ mod YASPoolTests {
                 .create_limit_order(
                     yas_pool.contract_address, OTHER(), tick_lower, 1000000000000000000
                 );
+        }
+
+        #[test]
+        #[available_gas(200000000000)]
+        fn test_create_limit_order_right_and_swap_deswap_collect() {
+            let (yas_pool, yas_router, token_0, token_1) = setup();
+            let tick_zero = get_tick_zero();
+            let tick_lower = get_right_tick(tick_zero, FeeAmount::LOW);
+            set_contract_address(WALLET());
+            let (_, amount1) = yas_router
+                .create_limit_order(
+                    yas_pool.contract_address, OTHER(), tick_lower, 1000000000000000000
+                );
+            assert(amount1 == 0, 'amount1 must be 0');
+            swap_exact_1_for_0(
+                yas_router, yas_pool.contract_address, 1000000000000000000, WALLET()
+            );
+            swap_exact_0_for_1(
+                yas_router, yas_pool.contract_address, 1000000000000000000, WALLET()
+            );
+            let (amount0, _) = yas_router
+                .collect_limit_order(yas_pool.contract_address, OTHER(), tick_lower);
+            assert(amount0 == 0, 'amount0 must be 0');
+        }
+
+        #[test]
+        #[available_gas(200000000000)]
+        fn test_create_limit_order_left_and_swap_deswap_collect() {
+            let (yas_pool, yas_router, token_0, token_1) = setup();
+            let tick_zero = get_tick_zero();
+            let tick_lower = get_left_tick(
+                get_left_tick(tick_zero, FeeAmount::LOW), FeeAmount::LOW
+            );
+            set_contract_address(WALLET());
+            let (amount0, _) = yas_router
+                .create_limit_order(
+                    yas_pool.contract_address, OTHER(), tick_lower, 1000000000000000000
+                );
+            assert(amount0 == 0, 'amount0 must be 0');
+            swap_exact_0_for_1(
+                yas_router, yas_pool.contract_address, 1000000000000000000, WALLET()
+            );
+            swap_exact_1_for_0(
+                yas_router, yas_pool.contract_address, 1000000000000000000, WALLET()
+            );
+            let (_, amount1) = yas_router
+                .collect_limit_order(yas_pool.contract_address, OTHER(), tick_lower);
+            assert(amount1 == 0, 'amount1 must be 0');
         }
     }
 
