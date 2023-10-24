@@ -26,12 +26,12 @@ trait IYASPool<TContractState> {
         recipient: ContractAddress,
         tick_lower: i32,
         amount: u128,
-    );
+    ) -> (u256, u256);
     fn collect_limit_order(
         ref self: TContractState,
         recipient: ContractAddress,
         tick_lower: i32,
-    );
+    ) -> (u256, u256);
     fn token_0(self: @TContractState) -> ContractAddress;
     fn token_1(self: @TContractState) -> ContractAddress;
 }
@@ -166,10 +166,18 @@ use super::IYASPool;
         liquidity_delta: i128
     }
 
+    // <-- BAL7HAZAR CHANGES -->
     #[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
     struct Order {
-        initial_amount: u128,
+        zero_for_one: bool,
+        active: bool,
         amount: u128,
+    }
+
+    #[derive(Copy, Drop, Hash, Serde)]
+    struct OrderKey {
+        owner: ContractAddress,
+        tick_lower: i32,
     }
 
     #[storage]
@@ -186,10 +194,14 @@ use super::IYASPool;
         protocol_fees: ProtocolFees,
         tick_spacing: i32,
         unlocked: bool,
-        // Bal7hazar changes
-        orders_key_len: LegacyMap<i32, u32>,
-        orders_key_index: LegacyMap<(i32, felt252), u32>,
-        orders_key: LegacyMap<(i32, u32), felt252>,
+        // <-- BAL7HAZAR CHANGES -->
+        // Map of (tick, zero_for_one) -> orders_count
+        orders_key_len: LegacyMap<(i32, bool), u32>,
+        // Map of (tick, zero_for_one, order_key) -> orders_index
+        orders_key_index: LegacyMap<(i32, bool, felt252), u32>,
+        // Map of (tick, zero_for_one, orders_index) -> order_key
+        orders_key: LegacyMap<(i32, bool, u32), felt252>,
+        // Map of (order_key) -> order
         orders: LegacyMap<felt252, Order>,
     }
 
@@ -309,42 +321,6 @@ use super::IYASPool;
                     break;
                 }
 
-                // <-- BAL7HAZAR CHANGES -->
-                // [Effect] Manage orders for the current tick
-                let mut orders_key_len = self.orders_key_len.read(state.tick);
-                let mut to_fill_amount = amount_specified - state.amount_specified_remaining - filled_amount;
-                let mut order_index = 0;
-                loop {
-                    if to_fill_amount.is_zero() && orders_key_len == order_index {
-                        break;
-                    };
-                    let order_key = self.orders_key.read((state.tick, order_index));
-                    let mut order = self.orders.read(order_key);
-                    // TODO: Manage amount direction
-                    if order.initial_amount.into() < to_fill_amount.try_into().unwrap() {
-                        order.amount = order.initial_amount;
-                        to_fill_amount -= i256 { mag: order.initial_amount.into(), sign: false };
-                        // [Effect] Remove filled order, to save gas it will brings the last to the current index
-                        self.remove_order(state.tick, order_key);
-                        orders_key_len -= 1;
-                        // Trick to keep the right order order
-                        if order_index + 1 < orders_key_len {
-                            order_index += 1;
-                        } else {
-                            order_index = 0;
-                        };
-                    } else {
-                        if to_fill_amount.sign {
-                            order.amount += (-to_fill_amount).try_into().unwrap().try_into().unwrap();
-                        } else {
-                            order.amount += to_fill_amount.try_into().unwrap().try_into().unwrap();
-                        }
-                        to_fill_amount = Zeroable::zero();
-                    };
-                };
-                filled_amount += amount_specified - state.amount_specified_remaining - filled_amount;
-                // <-- BAL7HAZAR CHANGES -->
-
                 let step_sqrt_price_start_X96 = state.sqrt_price_X96;
 
                 // TODO: test mut
@@ -358,6 +334,18 @@ use super::IYASPool;
                     step_tick_next = MIN_TICK();
                 } else if step_tick_next > MAX_TICK() {
                     step_tick_next = MAX_TICK();
+                };
+
+                // <-- BAL7HAZAR CHANGES -->
+                // [Compute] If tick changes, fill corresponding orders
+                if state.tick != step_tick_next {
+                    let key = if state.tick > step_tick_next {
+                        (step_tick_next, zero_for_one)
+                    } else {
+                        (state.tick, zero_for_one)
+                    };
+                    // [Effect] Erase array by setting length to 0, gas free
+                    self.orders_key_len.write(key, 0)
                 };
 
                 // get the price for the next tick
@@ -545,12 +533,14 @@ use super::IYASPool;
             self.check_and_lock();
 
             assert(amount > 0, 'amount must be greater than 0');
+            let slot_0 = self.slot_0.read();
             let (_, amount_0, amount_1) = self
                 .modify_position(
                     ModifyPositionParams {
                         position_key: PositionKey { owner: recipient, tick_lower, tick_upper },
                         liquidity_delta: amount.into()
-                    }
+                    },
+                    slot_0
                 );
 
             let amount_0: u256 = amount_0.try_into().unwrap();
@@ -603,56 +593,126 @@ use super::IYASPool;
             recipient: ContractAddress,
             tick_lower: i32,
             amount: u128,
-        ) {
-            // [Check] Above the current price
-            let current_price = self.slot_0.read().sqrt_price_X96;
-            let lower_price = get_sqrt_ratio_at_tick(tick_lower);
-            assert(lower_price > current_price, 'tick_lower too low');
+        ) -> (u256, u256) {
+            // [Compute] Zero for one and tick upper
+            let current_tick = self.slot_0.read().tick;
+            let zero_for_one = current_tick >= tick_lower;
+            let tick_spacing = self.tick_spacing.read();
+            let tick_upper = if zero_for_one {
+                tick_lower + tick_spacing
+            } else {
+                tick_lower - tick_spacing
+            };
+
+            // [Check] Limit order is not at or not crossing the current price.
+            assert(tick_lower != current_tick, 'order is at the current price');
+            assert(tick_upper != current_tick, 'order crosses the current price');
 
             // [Check] Order not already exists
-            let tick_upper = tick_lower + self.tick_spacing.read();
-            let position_key = PositionKey { owner: recipient, tick_lower, tick_upper };
-            let order_key = PoseidonTrait::new().update_with(position_key).finalize();
-            let order_index = self.orders_key_index.read((tick_lower, order_key));
-            let stored_order_key = self.orders_key.read((tick_lower, order_index));
-            assert(order_key != stored_order_key, 'order already exists');
+            let order_key = OrderKey { owner: recipient, tick_lower };
+            let hashed_key = PoseidonTrait::new().update_with(order_key).finalize();
+            let stored_key_index = self.orders_key_index.read((tick_lower, zero_for_one, hashed_key));
+            let stored_order_len = self.orders_key_len.read((tick_lower, zero_for_one));
+            let stored_key = if stored_order_len < stored_key_index {
+                self.orders_key.read((tick_lower, zero_for_one, stored_key_index))
+            } else {
+                0
+            };
+            assert(hashed_key != stored_key, 'order already exists');
+
+            // [Check] Previous order has been collected
+            let order = Order { zero_for_one, active: true, amount };
+            let stored_order = self.orders.read(hashed_key);
+            assert(order != stored_order, 'order must be collected');
 
             // [Effect] Store order
-            let order: Order = Order { initial_amount: amount, amount: 0 };
-            self.orders.write(order_key, order);
-            self.orders_key.write((tick_lower, order_index), order_key);
-            self.orders_key_index.write((tick_lower, order_key), order_index);
-            self.orders_key_len.write(tick_lower, order_index + 1);
+            let order_index = self.orders_key_len.read((tick_lower, zero_for_one));
+            self.orders.write(hashed_key, order);
+            self.orders_key.write((tick_lower, zero_for_one, order_index), hashed_key);
+            self.orders_key_index.write((tick_lower, zero_for_one, hashed_key), order_index);
+            self.orders_key_len.write((tick_lower, zero_for_one), order_index + 1);
 
             // [Effect] Mint
-            self.mint(recipient, tick_lower, tick_upper, amount, array![]);
-            
-            // TODO: Emit event if needed
+            self.mint(recipient, tick_lower, tick_upper, amount, array![])
         }
 
         fn collect_limit_order(
             ref self: ContractState,
             recipient: ContractAddress,
             tick_lower: i32,
-        ) {
-            // [Compute] Get position
-            let tick_upper = tick_lower + self.tick_spacing.read();
-            let position_key = PositionKey { owner: recipient, tick_lower, tick_upper };
-            let order_key = PoseidonTrait::new().update_with(position_key).finalize();
-            let order = self.orders.read(order_key);
-
-            // [Check] Order exists
-            assert(order.initial_amount > 0, 'order does not exists');
-
-            // [Effect] Transfer swaped tokens
-            let amount_owed = order.initial_amount - order.amount;
-            if amount_owed > 0 {
-                // TODO: Update owed tokens in position
-            }
-
-            // [Effect] Burn remaining position 
-            // self.burn(tick_lower, tick_upper, ?);
+        ) -> (u256, u256) {
+            // [Compute] Zero for one and tick upper
+            let order_key = OrderKey { owner: recipient, tick_lower };
+            let hashed_key = PoseidonTrait::new().update_with(order_key).finalize();
+            let mut stored_order = self.orders.read(hashed_key);
             
+            // [Check] Order exists
+            assert(stored_order.active, 'order does not exist');
+
+            // [Effect] Remove order
+            let amount = stored_order.amount;
+            let tick_spacing = self.tick_spacing.read();
+            let tick_upper = if stored_order.zero_for_one {
+                tick_lower + tick_spacing
+            } else {
+                tick_lower - tick_spacing
+            };
+            stored_order.active = false;
+            stored_order.zero_for_one = false;
+            stored_order.amount = 0;
+            self.orders.write(hashed_key, stored_order);
+            
+            // [Compute] Amounts to claim
+            let stored_order_index = self.orders_key_index.read((tick_lower, stored_order.zero_for_one, hashed_key));
+            let stored_order_len = self.orders_key_len.read((tick_lower, stored_order.zero_for_one));
+            let stored_order_key = if stored_order_len < stored_order_index {
+                self.orders_key.read((tick_lower, stored_order.zero_for_one, stored_order_index))
+            } else {
+                0
+            };
+            let (amount0, amount1) = if hashed_key != stored_order_key {
+               // [Compute] If order has been filled, update position
+                let mut slot_0 = self.slot_0.read();
+                slot_0.tick = tick_upper;
+                let (_, amount_0, amount_1) = self.modify_position(
+                    ModifyPositionParams {
+                        position_key: PositionKey {
+                            owner: get_caller_address(), tick_lower, tick_upper
+                        },
+                        liquidity_delta: amount.into()
+                    },
+                    slot_0
+                );
+                let amount_0: u256 = amount_0.try_into().unwrap();
+                let amount_1: u256 = amount_1.try_into().unwrap();
+                (amount_0, amount_1)
+            } else {
+                 // [Effect] Otherwise burn the position
+                // TODO: Enable when burn is implemented
+                // self.burn(tick_lower, tick_upper, amount, array![])
+                let slot_0 = self.slot_0.read();
+                let (_, amount_0, amount_1) = self.modify_position(
+                    ModifyPositionParams {
+                        position_key: PositionKey {
+                            owner: get_caller_address(), tick_lower, tick_upper
+                        },
+                        liquidity_delta: amount.into()
+                    },
+                    slot_0
+                );
+                let amount_0: u256 = amount_0.try_into().unwrap();
+                let amount_1: u256 = amount_1.try_into().unwrap();
+                (amount_0, amount_1)
+            };
+
+            // [Effect] Remove order
+            stored_order.active = false;
+            stored_order.zero_for_one = false;
+            stored_order.amount = 0;
+            self.orders.write(hashed_key, stored_order);
+
+            // [Return] Amounts to claim
+            (amount0, amount1)
         }
     }
 
@@ -758,7 +818,7 @@ use super::IYASPool;
         /// @return amount0 the amount of token0 owed to the pool, negative if the pool should pay the recipient
         /// @return amount1 the amount of token1 owed to the pool, negative if the pool should pay the recipient
         fn modify_position(
-            ref self: ContractState, params: ModifyPositionParams
+            ref self: ContractState, params: ModifyPositionParams, slot_0: Slot0,
         ) -> (Info, i256, i256) // TODO: noDelegateCall
         {
             match check_ticks(params.position_key.tick_lower, params.position_key.tick_upper) {
@@ -768,7 +828,6 @@ use super::IYASPool;
                 },
             }
 
-            let slot_0 = self.slot_0.read();
             let position = self
                 .update_position(params.position_key, params.liquidity_delta, slot_0.tick);
 
@@ -882,23 +941,6 @@ use super::IYASPool;
         fn balance_1(self: @ContractState) -> u256 {
             IERC20Dispatcher { contract_address: self.token_1.read() }
                 .balanceOf(get_contract_address())
-        }
-
-        fn remove_order(ref self: ContractState, tick: i32, order_key: felt252) {
-            // [Compute] Last order
-            let last_order_index = self.orders_key_len.read(tick) - 1;
-            let last_order_key = self.orders_key.read((tick, last_order_index));
-            // [Compute] Remove the last one
-            // TODO: ensure reauired, set storage to 0 must be free
-            let order_index = self.orders_key_index.read((tick, order_key));
-            self.orders_key.write((tick, last_order_index), 0);
-            self.orders_key_index.write((tick, order_key), 0);
-            self.orders_key_len.write(tick, last_order_index);
-            if last_order_index != order_index {
-                // [Effect] Replace the one to remove
-                self.orders_key_index.write((tick, last_order_key), order_index);
-                self.orders_key.write((tick, order_index), last_order_key);
-            };
         }
     }
 
