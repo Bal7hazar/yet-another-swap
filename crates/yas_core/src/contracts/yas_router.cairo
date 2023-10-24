@@ -110,7 +110,9 @@ mod YASRouter {
             amount: u128,
         ) -> (u256, u256) {
             IYASPoolDispatcher { contract_address: pool }
-                .create_limit_order(recipient, tick_lower, amount)
+                .create_limit_order(
+                    recipient, tick_lower, amount, array![get_caller_address().into()]
+                )
         }
 
         fn collect_limit_order(

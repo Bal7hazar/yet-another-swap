@@ -22,7 +22,11 @@ trait IYASPool<TContractState> {
         data: Array<felt252>
     ) -> (u256, u256);
     fn create_limit_order(
-        ref self: TContractState, recipient: ContractAddress, tick_lower: i32, amount: u128,
+        ref self: TContractState,
+        recipient: ContractAddress,
+        tick_lower: i32,
+        amount: u128,
+        data: Array<felt252>
     ) -> (u256, u256);
     fn collect_limit_order(
         ref self: TContractState, recipient: ContractAddress, tick_lower: i32,
@@ -60,8 +64,8 @@ mod YASPool {
         FixedType, FixedTrait, FP64x96PartialOrd, FP64x96PartialEq, FP64x96Impl, FP64x96Zeroable
     };
     use yas_core::numbers::signed_integer::{
-        i32::i32, i64::i64, i128::{i128, u128Intoi128}, i256::{i256, i256TryIntou256},
-        integer_trait::IntegerTrait
+        i32::i32, i32::i32_div_no_round, i64::i64, i128::{i128, u128Intoi128},
+        i256::{i256, i256TryIntou256}, integer_trait::IntegerTrait
     };
     use yas_core::utils::math_utils::Constants::Q128;
     use yas_core::utils::math_utils::FullMath;
@@ -584,20 +588,20 @@ mod YASPool {
         }
 
         fn create_limit_order(
-            ref self: ContractState, recipient: ContractAddress, tick_lower: i32, amount: u128,
+            ref self: ContractState,
+            recipient: ContractAddress,
+            tick_lower: i32,
+            amount: u128,
+            data: Array<felt252>
         ) -> (u256, u256) {
             // [Compute] Zero for one and tick upper
             let current_tick = self.slot_0.read().tick;
             let zero_for_one = current_tick >= tick_lower;
             let tick_spacing = self.tick_spacing.read();
-            let tick_upper = if zero_for_one {
-                tick_lower + tick_spacing
-            } else {
-                tick_lower - tick_spacing
-            };
+            let tick_upper = tick_lower + tick_spacing;
 
             // [Check] Limit order is not at or not crossing the current price.
-            assert(tick_lower != current_tick, 'order is at the current price');
+            assert(tick_lower != current_tick, 'order crosses the current price');
             assert(tick_upper != current_tick, 'order crosses the current price');
 
             // [Check] Order not already exists
@@ -607,7 +611,7 @@ mod YASPool {
                 .orders_key_index
                 .read((tick_lower, zero_for_one, hashed_key));
             let stored_order_len = self.orders_key_len.read((tick_lower, zero_for_one));
-            let stored_key = if stored_order_len < stored_key_index {
+            let stored_key = if stored_order_len > stored_key_index {
                 self.orders_key.read((tick_lower, zero_for_one, stored_key_index))
             } else {
                 0
@@ -627,7 +631,7 @@ mod YASPool {
             self.orders_key_len.write((tick_lower, zero_for_one), order_index + 1);
 
             // [Effect] Mint
-            self.mint(recipient, tick_lower, tick_upper, amount, array![])
+            self.mint(recipient, tick_lower, tick_upper, amount, data)
         }
 
         fn collect_limit_order(
@@ -641,20 +645,9 @@ mod YASPool {
             // [Check] Order exists
             assert(stored_order.active, 'order does not exist');
 
-            // [Effect] Remove order
-            let amount = stored_order.amount;
-            let tick_spacing = self.tick_spacing.read();
-            let tick_upper = if stored_order.zero_for_one {
-                tick_lower + tick_spacing
-            } else {
-                tick_lower - tick_spacing
-            };
-            stored_order.active = false;
-            stored_order.zero_for_one = false;
-            stored_order.amount = 0;
-            self.orders.write(hashed_key, stored_order);
-
             // [Compute] Amounts to claim
+            let tick_spacing = self.tick_spacing.read();
+            let tick_upper = tick_lower + tick_spacing;
             let stored_order_index = self
                 .orders_key_index
                 .read((tick_lower, stored_order.zero_for_one, hashed_key));
@@ -667,16 +660,21 @@ mod YASPool {
                 0
             };
             let (amount0, amount1) = if hashed_key != stored_order_key {
-                // [Compute] If order has been filled, update position
+                // [Compute] If order has been filled, update position with a custom tick
                 let mut slot_0 = self.slot_0.read();
-                slot_0.tick = tick_upper;
+                let tick = if stored_order.zero_for_one {
+                    tick_upper
+                } else {
+                    tick_lower
+                };
+                slot_0.tick = tick;
                 let (_, amount_0, amount_1) = self
                     .modify_position(
                         ModifyPositionParams {
                             position_key: PositionKey {
                                 owner: get_caller_address(), tick_lower, tick_upper
                             },
-                            liquidity_delta: amount.into()
+                            liquidity_delta: stored_order.amount.into()
                         },
                         slot_0
                     );
@@ -686,7 +684,7 @@ mod YASPool {
             } else {
                 // [Effect] Otherwise burn the position
                 // TODO: Enable when burn is implemented
-                // self.burn(tick_lower, tick_upper, amount, array![])
+                // self.burn(tick_lower, tick_upper, stored_order.amount, array![])
                 let slot_0 = self.slot_0.read();
                 let (_, amount_0, amount_1) = self
                     .modify_position(
@@ -694,7 +692,7 @@ mod YASPool {
                             position_key: PositionKey {
                                 owner: get_caller_address(), tick_lower, tick_upper
                             },
-                            liquidity_delta: amount.into()
+                            liquidity_delta: stored_order.amount.into()
                         },
                         slot_0
                     );
