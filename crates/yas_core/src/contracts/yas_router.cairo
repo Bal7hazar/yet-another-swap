@@ -21,10 +21,7 @@ trait IYASRouter<TContractState> {
         amount: u128,
     ) -> (u256, u256);
     fn collect_limit_order(
-        self: @TContractState,
-        pool: ContractAddress,
-        recipient: ContractAddress,
-        tick_lower: i32,
+        self: @TContractState, pool: ContractAddress, recipient: ContractAddress, tick_lower: i32,
     ) -> (u256, u256);
     fn yas_mint_callback(
         ref self: TContractState, amount_0_owed: u256, amount_1_owed: u256, data: Array<felt252>
@@ -112,7 +109,8 @@ mod YASRouter {
             tick_lower: i32,
             amount: u128,
         ) -> (u256, u256) {
-            IYASPoolDispatcher { contract_address: pool }.create_limit_order(recipient, tick_lower, amount)
+            IYASPoolDispatcher { contract_address: pool }
+                .create_limit_order(recipient, tick_lower, amount)
         }
 
         fn collect_limit_order(

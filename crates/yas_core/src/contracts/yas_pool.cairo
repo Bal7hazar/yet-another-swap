@@ -22,15 +22,10 @@ trait IYASPool<TContractState> {
         data: Array<felt252>
     ) -> (u256, u256);
     fn create_limit_order(
-        ref self: TContractState,
-        recipient: ContractAddress,
-        tick_lower: i32,
-        amount: u128,
+        ref self: TContractState, recipient: ContractAddress, tick_lower: i32, amount: u128,
     ) -> (u256, u256);
     fn collect_limit_order(
-        ref self: TContractState,
-        recipient: ContractAddress,
-        tick_lower: i32,
+        ref self: TContractState, recipient: ContractAddress, tick_lower: i32,
     ) -> (u256, u256);
     fn token_0(self: @TContractState) -> ContractAddress;
     fn token_1(self: @TContractState) -> ContractAddress;
@@ -39,7 +34,7 @@ trait IYASPool<TContractState> {
 #[starknet::contract]
 mod YASPool {
     use core::zeroable::Zeroable;
-use super::IYASPool;
+    use super::IYASPool;
     use poseidon::PoseidonTrait;
     use hash::{HashStateTrait, HashStateExTrait};
 
@@ -589,10 +584,7 @@ use super::IYASPool;
         }
 
         fn create_limit_order(
-            ref self: ContractState,
-            recipient: ContractAddress,
-            tick_lower: i32,
-            amount: u128,
+            ref self: ContractState, recipient: ContractAddress, tick_lower: i32, amount: u128,
         ) -> (u256, u256) {
             // [Compute] Zero for one and tick upper
             let current_tick = self.slot_0.read().tick;
@@ -611,7 +603,9 @@ use super::IYASPool;
             // [Check] Order not already exists
             let order_key = OrderKey { owner: recipient, tick_lower };
             let hashed_key = PoseidonTrait::new().update_with(order_key).finalize();
-            let stored_key_index = self.orders_key_index.read((tick_lower, zero_for_one, hashed_key));
+            let stored_key_index = self
+                .orders_key_index
+                .read((tick_lower, zero_for_one, hashed_key));
             let stored_order_len = self.orders_key_len.read((tick_lower, zero_for_one));
             let stored_key = if stored_order_len < stored_key_index {
                 self.orders_key.read((tick_lower, zero_for_one, stored_key_index))
@@ -637,15 +631,13 @@ use super::IYASPool;
         }
 
         fn collect_limit_order(
-            ref self: ContractState,
-            recipient: ContractAddress,
-            tick_lower: i32,
+            ref self: ContractState, recipient: ContractAddress, tick_lower: i32,
         ) -> (u256, u256) {
             // [Compute] Zero for one and tick upper
             let order_key = OrderKey { owner: recipient, tick_lower };
             let hashed_key = PoseidonTrait::new().update_with(order_key).finalize();
             let mut stored_order = self.orders.read(hashed_key);
-            
+
             // [Check] Order exists
             assert(stored_order.active, 'order does not exist');
 
@@ -661,45 +653,51 @@ use super::IYASPool;
             stored_order.zero_for_one = false;
             stored_order.amount = 0;
             self.orders.write(hashed_key, stored_order);
-            
+
             // [Compute] Amounts to claim
-            let stored_order_index = self.orders_key_index.read((tick_lower, stored_order.zero_for_one, hashed_key));
-            let stored_order_len = self.orders_key_len.read((tick_lower, stored_order.zero_for_one));
+            let stored_order_index = self
+                .orders_key_index
+                .read((tick_lower, stored_order.zero_for_one, hashed_key));
+            let stored_order_len = self
+                .orders_key_len
+                .read((tick_lower, stored_order.zero_for_one));
             let stored_order_key = if stored_order_len < stored_order_index {
                 self.orders_key.read((tick_lower, stored_order.zero_for_one, stored_order_index))
             } else {
                 0
             };
             let (amount0, amount1) = if hashed_key != stored_order_key {
-               // [Compute] If order has been filled, update position
+                // [Compute] If order has been filled, update position
                 let mut slot_0 = self.slot_0.read();
                 slot_0.tick = tick_upper;
-                let (_, amount_0, amount_1) = self.modify_position(
-                    ModifyPositionParams {
-                        position_key: PositionKey {
-                            owner: get_caller_address(), tick_lower, tick_upper
+                let (_, amount_0, amount_1) = self
+                    .modify_position(
+                        ModifyPositionParams {
+                            position_key: PositionKey {
+                                owner: get_caller_address(), tick_lower, tick_upper
+                            },
+                            liquidity_delta: amount.into()
                         },
-                        liquidity_delta: amount.into()
-                    },
-                    slot_0
-                );
+                        slot_0
+                    );
                 let amount_0: u256 = amount_0.try_into().unwrap();
                 let amount_1: u256 = amount_1.try_into().unwrap();
                 (amount_0, amount_1)
             } else {
-                 // [Effect] Otherwise burn the position
+                // [Effect] Otherwise burn the position
                 // TODO: Enable when burn is implemented
                 // self.burn(tick_lower, tick_upper, amount, array![])
                 let slot_0 = self.slot_0.read();
-                let (_, amount_0, amount_1) = self.modify_position(
-                    ModifyPositionParams {
-                        position_key: PositionKey {
-                            owner: get_caller_address(), tick_lower, tick_upper
+                let (_, amount_0, amount_1) = self
+                    .modify_position(
+                        ModifyPositionParams {
+                            position_key: PositionKey {
+                                owner: get_caller_address(), tick_lower, tick_upper
+                            },
+                            liquidity_delta: amount.into()
                         },
-                        liquidity_delta: amount.into()
-                    },
-                    slot_0
-                );
+                        slot_0
+                    );
                 let amount_0: u256 = amount_0.try_into().unwrap();
                 let amount_1: u256 = amount_1.try_into().unwrap();
                 (amount_0, amount_1)
